@@ -57,3 +57,5 @@ fix-docker.sh
 
 # WeChat Mini Program local/private configuration
 miniprogram/project.private.config.json
+# macOS filesystem metadata
+.DS_Store

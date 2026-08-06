@@ -1,0 +1,100 @@
+# Local test topology: reuse host PostgreSQL and Redis; only WeKnora services
+# and the Qdrant retrieval backend run in this Compose project.
+services:
+  frontend:
+    ports: !override
+      - "127.0.0.1:${FRONTEND_PORT:-18081}:80"
+
+  app:
+    env_file:
+      - path: .env
+        required: false
+    ports: !override
+      - "127.0.0.1:${APP_PORT:-18080}:8080"
+    depends_on: !override
+      docreader:
+        condition: service_healthy
+    # Upstream docker-compose.yml keeps this mount commented out; this local
+    # deployment provides config/builtin_models.yaml, so mount it here instead
+    # of editing the upstream file.
+    volumes:
+      - ./config/builtin_models.yaml:/app/config/builtin_models.yaml:ro
+
+  qdrant:
+    ports: !override
+      - "127.0.0.1:${QDRANT_REST_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_PORT:-6334}:6334"
+
+  # The local deployment keeps PostgreSQL and Redis on the host. Point the
+  # optional Langfuse stack at those instances instead of starting duplicates.
+  langfuse-db-init:
+    image: postgres:18
+    depends_on: !override {}
+    environment:
+      PGPASSWORD: ${LANGFUSE_DB_ADMIN_PASSWORD}
+    command:
+      - |
+        set -e
+        if psql -h ${LANGFUSE_DB_HOST:-host.docker.internal} -p ${LANGFUSE_DB_PORT:-55432} -U ${LANGFUSE_DB_ADMIN_USER} -d ${LANGFUSE_DB_ADMIN_NAME} -tAc "SELECT 1 FROM pg_database WHERE datname='${LANGFUSE_DB_NAME:-langfuse}'" | grep -q 1; then
+          echo "[langfuse-db-init] database '${LANGFUSE_DB_NAME:-langfuse}' already exists, skipping."
+        else
+          psql -h ${LANGFUSE_DB_HOST:-host.docker.internal} -p ${LANGFUSE_DB_PORT:-55432} -U ${LANGFUSE_DB_ADMIN_USER} -d ${LANGFUSE_DB_ADMIN_NAME} -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${LANGFUSE_DB_NAME:-langfuse}\" OWNER \"${DB_USER}\" TEMPLATE template0;"
+          echo "[langfuse-db-init] database '${LANGFUSE_DB_NAME:-langfuse}' created."
+        fi
+
+  langfuse-minio:
+    ports: !override
+      - "127.0.0.1:${LANGFUSE_MINIO_S3_PORT:-9100}:9000"
+      - "127.0.0.1:${LANGFUSE_MINIO_CONSOLE_PORT:-9101}:9001"
+
+  langfuse-worker:
+    depends_on: &local-langfuse-depends-on !override
+      langfuse-db-init:
+        condition: service_completed_successfully
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    environment:
+      _LF_DB_HOST: ${LANGFUSE_DB_HOST:-host.docker.internal}
+      _LF_DB_PORT: ${LANGFUSE_DB_PORT:-55432}
+      _LF_REDIS_HOST: ${LANGFUSE_REDIS_HOST:-host.docker.internal}
+      _LF_REDIS_PORT: ${LANGFUSE_REDIS_PORT:-6379}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        _enc() { node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$$1"; }
+        DU=$$(_enc "$$_LF_DB_USER")
+        DP=$$(_enc "$$_LF_DB_PASSWORD")
+        RP=$$(_enc "$$_LF_REDIS_PASSWORD")
+        export DATABASE_URL="postgresql://$$DU:$$DP@$$_LF_DB_HOST:$$_LF_DB_PORT/$$_LF_DB_NAME"
+        export REDIS_CONNECTION_STRING="redis://:$$RP@$$_LF_REDIS_HOST:$$_LF_REDIS_PORT/$$_LF_REDIS_DB"
+        unset _LF_DB_USER _LF_DB_PASSWORD _LF_REDIS_PASSWORD
+        exec dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js
+
+  langfuse-web:
+    depends_on: *local-langfuse-depends-on
+    ports: !override
+      - "127.0.0.1:${LANGFUSE_WEB_PORT:-3000}:3000"
+    environment:
+      _LF_DB_HOST: ${LANGFUSE_DB_HOST:-host.docker.internal}
+      _LF_DB_PORT: ${LANGFUSE_DB_PORT:-55432}
+      _LF_REDIS_HOST: ${LANGFUSE_REDIS_HOST:-host.docker.internal}
+      _LF_REDIS_PORT: ${LANGFUSE_REDIS_PORT:-6379}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        _enc() { node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$$1"; }
+        DU=$$(_enc "$$_LF_DB_USER")
+        DP=$$(_enc "$$_LF_DB_PASSWORD")
+        RP=$$(_enc "$$_LF_REDIS_PASSWORD")
+        export DATABASE_URL="postgresql://$$DU:$$DP@$$_LF_DB_HOST:$$_LF_DB_PORT/$$_LF_DB_NAME"
+        export REDIS_CONNECTION_STRING="redis://:$$RP@$$_LF_REDIS_HOST:$$_LF_REDIS_PORT/$$_LF_REDIS_DB"
+        unset _LF_DB_USER _LF_DB_PASSWORD _LF_REDIS_PASSWORD
+        if [ -n "$$NEXT_PUBLIC_LANGFUSE_CLOUD_REGION" ]; then
+          exec dumb-init -- ./web/entrypoint.sh node --import dd-trace/initialize.mjs ./web/server.js --keepAliveTimeout 110000
+        else
+          exec dumb-init -- ./web/entrypoint.sh node ./web/server.js --keepAliveTimeout 110000
+        fi

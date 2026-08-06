@@ -7,7 +7,20 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
+	oteltrace "go.opentelemetry.io/otel/trace"
+)
+
+const (
+	agentTraceName           = "ailx.agent.chat"
+	agentUserIDBaggageKey    = "ailx-user-id"
+	agentSessionIDBaggageKey = "ailx-session-id"
+)
+
+var httpPropagator = propagation.NewCompositeTextMapPropagator(
+	propagation.TraceContext{},
+	propagation.Baggage{},
 )
 
 // GinMiddleware returns a Gin handler that opens a Langfuse trace for each
@@ -32,12 +45,21 @@ func GinMiddleware() gin.HandlerFunc {
 		// agent-chat call it triggers land under the same trace in LiteFuse.
 		// When no traceparent is present (human UI calls, other clients) the
 		// root span starts a fresh trace as before.
-		ctx = propagator.Extract(ctx, propagation.HeaderCarrier(c.Request.Header))
+		ctx = httpPropagator.Extract(ctx, propagation.HeaderCarrier(c.Request.Header))
 		userID := extractUserID(ctx)
 		sessionID := extractSessionID(c)
+		httpObservationName := c.Request.Method + " " + c.FullPath()
+		traceName := httpObservationName
+		upstreamAgent := false
+		if agentUserID, agentSessionID, ok := extractAgentIdentity(ctx); ok {
+			userID = agentUserID
+			sessionID = agentSessionID
+			traceName = agentTraceName
+			upstreamAgent = true
+		}
 
 		opts := TraceOptions{
-			Name:      c.Request.Method + " " + c.FullPath(),
+			Name:      traceName,
 			UserID:    userID,
 			SessionID: sessionID,
 			Metadata: map[string]interface{}{
@@ -47,20 +69,56 @@ func GinMiddleware() gin.HandlerFunc {
 			},
 			Tags: []string{"http", strings.ToLower(c.Request.Method)},
 		}
+		if upstreamAgent {
+			opts.Metadata["weknora.session_id"] = extractSessionID(c)
+			opts.Metadata["ailx.user_id"] = userID
+			opts.Metadata["ailx.session_id"] = sessionID
+		}
 		if rid, ok := types.RequestIDFromContext(ctx); ok {
 			opts.Metadata["request_id"] = rid
 		}
 
-		newCtx, trace := mgr.StartTrace(ctx, opts)
+		var rootTrace *Trace
+		var requestSpan *Span
+		newCtx := ctx
+		upstreamSpanContext := oteltrace.SpanContextFromContext(ctx)
+		if upstreamAgent && upstreamSpanContext.IsValid() {
+			resumedCtx, resumedTrace := mgr.ResumeTrace(
+				ctx,
+				upstreamSpanContext.TraceID().String(),
+				upstreamSpanContext.SpanID().String(),
+			)
+			if resumedTrace != nil {
+				newCtx, requestSpan = mgr.StartSpan(resumedCtx, SpanOptions{
+					Name:     httpObservationName,
+					Metadata: opts.Metadata,
+				})
+			}
+		}
+		if requestSpan == nil {
+			newCtx, rootTrace = mgr.StartTrace(ctx, opts)
+		}
 		c.Request = c.Request.WithContext(newCtx)
 
 		c.Next()
 
-		trace.Finish(map[string]interface{}{
+		finishMetadata := map[string]interface{}{
 			"status":        c.Writer.Status(),
 			"response.size": c.Writer.Size(),
-		}, nil)
+		}
+		if requestSpan != nil {
+			requestSpan.Finish(nil, finishMetadata, nil)
+			return
+		}
+		rootTrace.Finish(finishMetadata, nil)
 	}
+}
+
+func extractAgentIdentity(ctx context.Context) (string, string, bool) {
+	identity := baggage.FromContext(ctx)
+	userID := strings.TrimSpace(identity.Member(agentUserIDBaggageKey).Value())
+	sessionID := strings.TrimSpace(identity.Member(agentSessionIDBaggageKey).Value())
+	return userID, sessionID, userID != "" && sessionID != ""
 }
 
 // shouldTrace restricts tracing to endpoints where LLM work (or the asynq

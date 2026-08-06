@@ -1,0 +1,53 @@
+builtin_models:
+  - id: builtin-ailx-deepseek-v4-flash
+    name: ${WEKNORA_LLM_MODEL}
+    type: KnowledgeQA
+    source: remote
+    description: AILX 默认知识问答模型
+    is_default: true
+    status: active
+    parameters:
+      base_url: ${WEKNORA_LLM_BASE_URL}
+      api_key: ${WEKNORA_LLM_API_KEY}
+      provider: deepseek
+      extra_config:
+        thinking_control: thinking_type
+
+  - id: builtin-ailx-gpt-5-6-terra
+    name: gpt-5.6-terra
+    type: KnowledgeQA
+    source: remote
+    description: AILX 文档解析与知识合成模型
+    is_default: false
+    status: active
+    parameters:
+      base_url: https://architectures.top/v1
+      api_key: ${OPENAI_API_KEY}
+      provider: openai
+
+  - id: builtin-ailx-gpt-5-6-sol-medium
+    name: gpt-5.6-sol
+    type: KnowledgeQA
+    source: remote
+    description: AILX GPT-5.6 Sol 中等推理模型
+    is_default: false
+    status: active
+    parameters:
+      base_url: https://architectures.top/v1
+      api_key: ${OPENAI_API_KEY}
+      provider: openai
+
+  - id: builtin-ailx-qwen37-embedding
+    name: ${WEKNORA_EMBEDDING_MODEL}
+    type: Embedding
+    source: remote
+    description: AILX 默认 1024 维文本向量模型
+    is_default: true
+    status: active
+    parameters:
+      base_url: ${WEKNORA_EMBEDDING_BASE_URL}
+      api_key: ${WEKNORA_EMBEDDING_API_KEY}
+      provider: aliyun
+      embedding_parameters:
+        dimension: 1024
+        truncate_prompt_tokens: 0
